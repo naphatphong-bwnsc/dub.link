@@ -17,7 +17,7 @@ const SUB_BATCH_SIZE = 50; // DB updates to run in parallel within each batch
 const BACKLOG_ALERT_THRESHOLD = 50_000; // Alert when stream length exceeds this
 const BACKLOG_AGE_ALERT_MS = 5 * 60 * 1000; // Alert when oldest pending entry is older than 5 minutes
 const LOCK_KEY = "lock:update-click-stats"; // Prevents concurrent GET/POST from double-counting
-const LOCK_TTL_SECONDS = 600; // ≥ cron maxDuration (600s) so lock outlives a running invocation
+const LOCK_TTL_SECONDS = 60; // ≥ cron maxDuration (60s) so lock outlives a running invocation
 
 type LinkAggregate = {
   linkId: string;

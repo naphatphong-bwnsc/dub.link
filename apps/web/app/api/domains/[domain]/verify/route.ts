@@ -15,7 +15,7 @@ import { DomainVerificationStatusProps } from "@/lib/types";
 import { getApexDomain, getSubdomain } from "@dub/utils";
 import { NextResponse } from "next/server";
 
-export const maxDuration = 30;
+export const maxDuration = 60;
 
 // GET /api/domains/[domain]/verify - get domain verification status
 export const GET = withWorkspace(

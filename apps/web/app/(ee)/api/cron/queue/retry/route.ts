@@ -5,7 +5,7 @@ import { logAndRespond } from "../../utils";
 
 export const dynamic = "force-dynamic";
 
-// Lock for the cron job. TTL must be ≥ cron maxDuration (600s in vercel.json)
+// Lock for the cron job. TTL must be ≥ cron  (600s in vercel.json)
 // so the lock cannot expire while a run is still alive and allow a concurrent
 // minute-cron invocation
 const LOCK_KEY = "lock:queue-retry";

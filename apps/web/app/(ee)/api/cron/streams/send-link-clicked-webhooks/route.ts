@@ -1,34 +1,266 @@
-import { transformLink } from "@/lib/api/links/utils/transform-link";
 import { withCron } from "@/lib/cron/with-cron";
-import { prisma } from "@/lib/prisma";
-import { ClickEventTB } from "@/lib/types";
+import { conn } from "@/lib/planetscale";
 import { redis } from "@/lib/upstash/redis";
 import { RedisStreamEntry } from "@/lib/upstash/redis-streams/client";
-import { workspaceClickEventStream } from "@/lib/upstash/redis-streams/workspace-click-events";
-import { LINK_CLICK_WEBHOOK_TRIGGER } from "@/lib/webhook/constants";
-import { sendWebhooks } from "@/lib/webhook/qstash";
-import { transformClickEventData } from "@/lib/webhook/transform";
-import { chunk, groupBy } from "@dub/utils";
-import { NextResponse } from "next/server";
+import {
+  LinkClickEvent,
+  linkClickEventStream,
+} from "@/lib/upstash/redis-streams/link-click-events";
+import { log } from "@dub/utils";
+import { waitUntil } from "@vercel/functions";
 import { logAndRespond } from "../../utils";
 
 export const dynamic = "force-dynamic";
 
-// How many stream entries to drain per run
-const BATCH_SIZE = 6000;
+const BATCH_SIZE = 10_000; // Max stream entries to consume per cron run
+const SUB_BATCH_SIZE = 50; // DB updates to run in parallel within each batch
+const BACKLOG_ALERT_THRESHOLD = 50_000; // Alert when stream length exceeds this
+const BACKLOG_AGE_ALERT_MS = 5 * 60 * 1000; // Alert when oldest pending entry is older than 5 minutes
+const LOCK_KEY = "lock:update-click-stats"; // Prevents concurrent GET/POST from double-counting
+const LOCK_TTL_SECONDS = 60; // ≥ cron  (60s) so lock outlives a running invocation
 
-// How many webhook deliveries to enqueue to QStash in parallel
-const SEND_CONCURRENCY = 100;
+type LinkAggregate = {
+  linkId: string;
+  clicks: number;
+  lastClicked: number;
+  entryIds: string[];
+};
 
-// Lock for the cron job. TTL must be ≥ cron maxDuration (600s in vercel.json)
-// so the lock cannot expire while a run is still alive and allow a concurrent
-// minute-cron invocation
-const LOCK_KEY = "lock:send-link-clicked-webhooks";
-const LOCK_TTL_SECONDS = 600;
+type WorkspaceAggregate = {
+  workspaceId: string;
+  clicks: number;
+};
 
-// Drains the workspace:click:events stream and delivers link.clicked webhooks.
-// Runs every minute (see vercel.json).
-// GET /api/cron/streams/send-link-clicked-webhooks
+const aggregateClickStats = (
+  entries: RedisStreamEntry<LinkClickEvent>[],
+): {
+  linkUpdates: LinkAggregate[];
+  workspaceUpdates: WorkspaceAggregate[];
+} => {
+  const links = new Map<string, LinkAggregate>();
+  const workspaces = new Map<string, WorkspaceAggregate>();
+
+  for (const entry of entries) {
+    const { linkId, workspaceId, timestamp } = entry.data;
+
+    if (!linkId) {
+      continue;
+    }
+
+    const parsedTimestamp = Date.parse(timestamp);
+    const lastClicked = Number.isFinite(parsedTimestamp)
+      ? parsedTimestamp
+      : Date.now();
+
+    const existingLink = links.get(linkId);
+    if (existingLink) {
+      existingLink.clicks += 1;
+      existingLink.lastClicked = Math.max(
+        existingLink.lastClicked,
+        lastClicked,
+      );
+      existingLink.entryIds.push(entry.id);
+    } else {
+      links.set(linkId, {
+        linkId,
+        clicks: 1,
+        lastClicked,
+        entryIds: [entry.id],
+      });
+    }
+
+    if (workspaceId) {
+      const existingWorkspace = workspaces.get(workspaceId);
+      if (existingWorkspace) {
+        existingWorkspace.clicks += 1;
+      } else {
+        workspaces.set(workspaceId, {
+          workspaceId,
+          clicks: 1,
+        });
+      }
+    }
+  }
+
+  return {
+    linkUpdates: Array.from(links.values()),
+    workspaceUpdates: Array.from(workspaces.values()),
+  };
+};
+
+const processInSubBatches = async <T>(
+  items: T[],
+  handler: (item: T) => Promise<{ success: boolean; error?: unknown }>,
+) => {
+  const errors: unknown[] = [];
+  let totalProcessed = 0;
+
+  for (let i = 0; i < items.length; i += SUB_BATCH_SIZE) {
+    const batch = items.slice(i, i + SUB_BATCH_SIZE);
+    const results = await Promise.allSettled(batch.map(handler));
+
+    for (const result of results) {
+      if (result.status === "fulfilled" && result.value.success) {
+        totalProcessed++;
+      } else if (result.status === "fulfilled" && result.value.error) {
+        errors.push(result.value.error);
+      } else if (result.status === "rejected") {
+        errors.push(result.reason);
+      }
+    }
+  }
+
+  return { totalProcessed, errors };
+};
+
+const getStreamEntryAgeMs = (entryId: string | null) => {
+  if (!entryId) {
+    return null;
+  }
+
+  const timestampMs = Number(entryId.split("-")[0]);
+  if (!Number.isFinite(timestampMs)) {
+    return null;
+  }
+
+  return Date.now() - timestampMs;
+};
+
+const processClickStatsStreamBatch = () =>
+  linkClickEventStream.processBatch<LinkClickEvent>(
+    async (entries) => {
+      if (!entries || entries.length === 0) {
+        return {
+          success: true,
+          linkUpdates: [],
+          workspaceUpdates: [],
+          processedEntryIds: [],
+          totalProcessed: 0,
+          errors: [],
+        };
+      }
+
+      console.log(`Aggregating ${entries.length} click stats events`);
+
+      const { linkUpdates, workspaceUpdates } = aggregateClickStats(entries);
+
+      if (linkUpdates.length === 0) {
+        console.log("No click stats updates to process");
+        return {
+          success: true,
+          linkUpdates: [],
+          workspaceUpdates: [],
+          processedEntryIds: entries.map((entry) => entry.id),
+          totalProcessed: 0,
+          errors: [],
+        };
+      }
+
+      console.log(
+        `Processing ${linkUpdates.length} link, ${workspaceUpdates.length} workspace click stats updates...`,
+      );
+
+      const processedEntryIds: string[] = [];
+      const errors: unknown[] = [];
+
+      const linkResult = await processInSubBatches(
+        linkUpdates,
+        async (update) => {
+          try {
+            const lastClickedAt = new Date(update.lastClicked)
+              .toISOString()
+              .slice(0, 19)
+              .replace("T", " ");
+
+            await conn.execute(
+              "UPDATE Link SET clicks = clicks + ?, lastClicked = GREATEST(COALESCE(lastClicked, ?), ?) WHERE id = ?",
+              [update.clicks, lastClickedAt, lastClickedAt, update.linkId],
+            );
+            processedEntryIds.push(...update.entryIds);
+            return { success: true };
+          } catch (error) {
+            console.error(`Failed to update link ${update.linkId}:`, error);
+            return {
+              success: false,
+              error: { linkId: update.linkId, error },
+            };
+          }
+        },
+      );
+      errors.push(...linkResult.errors);
+
+      const workspaceResult = await processInSubBatches(
+        workspaceUpdates,
+        async (update) => {
+          try {
+            await conn.execute(
+              "UPDATE Project p SET p.usage = p.usage + ?, p.totalClicks = p.totalClicks + ? WHERE id = ?",
+              [update.clicks, update.clicks, update.workspaceId],
+            );
+            return { success: true };
+          } catch (error) {
+            console.error(
+              `Failed to update workspace ${update.workspaceId}:`,
+              error,
+            );
+            return {
+              success: false,
+              error: { workspaceId: update.workspaceId, error },
+            };
+          }
+        },
+      );
+      errors.push(...workspaceResult.errors);
+
+      const totalProcessed =
+        linkResult.totalProcessed + workspaceResult.totalProcessed;
+
+      console.log(
+        `Processed ${linkResult.totalProcessed}/${linkUpdates.length} links, ${workspaceResult.totalProcessed}/${workspaceUpdates.length} workspaces`,
+      );
+
+      if (errors.length > 0) {
+        console.error(
+          `Encountered ${errors.length} errors while processing click stats:`,
+          errors.slice(0, 5),
+        );
+      }
+
+      return {
+        linkUpdates,
+        workspaceUpdates,
+        errors,
+        totalProcessed,
+        processedEntryIds,
+        entriesProcessed: entries.length,
+      };
+    },
+    {
+      count: BATCH_SIZE,
+      deleteAfterRead: true,
+    },
+  );
+
+const maybeAlertOnBacklog = async (streamInfo: {
+  length: number;
+  firstEntryId: string | null;
+}) => {
+  const ageMs = getStreamEntryAgeMs(streamInfo.firstEntryId);
+  const isBackloggedByLength = streamInfo.length > BACKLOG_ALERT_THRESHOLD;
+  const isBackloggedByAge =
+    ageMs !== null && ageMs > BACKLOG_AGE_ALERT_MS && streamInfo.length > 0;
+
+  if (!isBackloggedByLength && !isBackloggedByAge) {
+    return;
+  }
+
+  await log({
+    message: `Click stats stream backlog alert: length=${streamInfo.length}, oldestAgeMs=${ageMs ?? "unknown"}, firstEntryId=${streamInfo.firstEntryId ?? "none"}`,
+    type: "errors",
+  });
+};
+
+// GET /api/cron/streams/update-click-stats
 export const GET = withCron(async () => {
   const acquired = await redis.set(LOCK_KEY, "1", {
     nx: true,
@@ -37,274 +269,33 @@ export const GET = withCron(async () => {
 
   if (!acquired) {
     return logAndRespond(
-      "[send-link-clicked-webhooks] Another run is in progress. Skipping...",
+      "[update-click-stats] Another run is in progress. Skipping...",
     );
   }
 
-  try {
-    const start = Date.now();
+  const { linkUpdates, errors, totalProcessed } =
+    await processClickStatsStreamBatch();
 
-    const { processed, sent, failed, processedEntryIds } =
-      await processStreamBatch();
+  const streamInfo = await linkClickEventStream.getStreamInfo();
 
-    const streamInfo = await workspaceClickEventStream.getStreamInfo();
+  await redis.del(LOCK_KEY);
 
-    console.log({
-      processed,
-      sent,
-      failed,
-      processedEntryIds,
+  waitUntil(maybeAlertOnBacklog(streamInfo));
+
+  if (!linkUpdates.length) {
+    return logAndRespond({
+      success: true,
+      processed: 0,
       streamInfo,
-      timeTaken: `${Date.now() - start}ms`,
+      message: "No updates to process",
     });
-
-    return NextResponse.json("Finished processing stream.");
-  } finally {
-    await redis.del(LOCK_KEY);
   }
+
+  return logAndRespond({
+    success: true,
+    processed: totalProcessed,
+    errors: errors?.length || 0,
+    streamInfo,
+    message: `Successfully processed ${totalProcessed} click stats updates`,
+  });
 });
-
-const processStreamBatch = (): Promise<{
-  processed: number;
-  sent: number;
-  failed: number;
-  processedEntryIds: string[];
-}> =>
-  workspaceClickEventStream.processBatch<ClickEventTB>(
-    async (entries) => {
-      if (!entries || entries.length === 0) {
-        return {
-          processed: 0,
-          sent: 0,
-          failed: 0,
-          processedEntryIds: [],
-        };
-      }
-
-      const workspaceIds = [
-        ...new Set(entries.map((e) => e.data.workspace_id).filter(Boolean)),
-      ];
-      const linkIds = [
-        ...new Set(entries.map((e) => e.data.link_id).filter(Boolean)),
-      ];
-
-      const [workspaces, links] = await Promise.all([
-        prisma.project.findMany({
-          where: {
-            id: {
-              in: workspaceIds,
-            },
-          },
-          select: {
-            id: true,
-            usage: true,
-            usageLimit: true,
-            webhooks: {
-              where: {
-                disabledAt: null,
-                triggers: {
-                  array_contains: [LINK_CLICK_WEBHOOK_TRIGGER],
-                },
-              },
-              select: {
-                id: true,
-                url: true,
-                secret: true,
-                linkScope: true,
-                projectId: true,
-              },
-            },
-          },
-        }),
-
-        prisma.link.findMany({
-          where: {
-            id: {
-              in: linkIds,
-            },
-          },
-          include: {
-            tags: {
-              select: {
-                tag: {
-                  select: {
-                    id: true,
-                    name: true,
-                    color: true,
-                  },
-                },
-              },
-            },
-          },
-        }),
-      ]);
-
-      const webhooks = workspaces.flatMap((w) => w.webhooks);
-
-      const linkScopeWebhookIds = webhooks
-        .filter((w) => w.linkScope === "links")
-        .map((w) => w.id);
-
-      const linkFolderScopeWebhookIds = webhooks
-        .filter((w) => w.linkScope === "folders")
-        .map((w) => w.id);
-
-      const folderIds = [
-        ...new Set(
-          links.map((l) => l.folderId).filter((id): id is string => id != null),
-        ),
-      ];
-
-      const [linkWebhooks, folderWebhooks] = await Promise.all([
-        linkScopeWebhookIds.length > 0 && linkIds.length > 0
-          ? prisma.linkWebhook.findMany({
-              where: {
-                webhookId: {
-                  in: linkScopeWebhookIds,
-                },
-                linkId: {
-                  in: linkIds,
-                },
-              },
-              select: {
-                webhookId: true,
-                linkId: true,
-              },
-            })
-          : Promise.resolve([]),
-
-        linkFolderScopeWebhookIds.length > 0 && folderIds.length > 0
-          ? prisma.folderWebhook.findMany({
-              where: {
-                webhookId: {
-                  in: linkFolderScopeWebhookIds,
-                },
-                folderId: {
-                  in: folderIds,
-                },
-              },
-              select: {
-                webhookId: true,
-                folderId: true,
-              },
-            })
-          : Promise.resolve([]),
-      ]);
-
-      const linkWebhooksByLinkId = groupBy(linkWebhooks, (r) => r.linkId);
-      const folderWebhooksByFolderId = groupBy(
-        folderWebhooks,
-        (r) => r.folderId,
-      );
-      const webhooksByWorkspace = groupBy(webhooks, (w) => w.projectId);
-      const workspaceById = new Map(workspaces.map((p) => [p.id, p]));
-      const linkById = new Map(links.map((l) => [l.id, l]));
-
-      const sendTasks: {
-        entryId: string;
-        task: () => Promise<boolean>;
-      }[] = [];
-      const processedEntryIds: string[] = [];
-
-      for (const entry of entries as RedisStreamEntry<ClickEventTB>[]) {
-        const event = entry.data;
-        const workspaceWebhooks = webhooksByWorkspace[event.workspace_id] ?? [];
-
-        if (workspaceWebhooks.length === 0) {
-          processedEntryIds.push(entry.id);
-          continue;
-        }
-
-        const workspace = workspaceById.get(event.workspace_id);
-        if (!workspace || workspace.usage >= workspace.usageLimit) {
-          processedEntryIds.push(entry.id);
-          continue;
-        }
-
-        const link = linkById.get(event.link_id);
-        if (!link) {
-          processedEntryIds.push(entry.id);
-          continue;
-        }
-
-        const applicableWebhooks = workspaceWebhooks.filter((webhook) => {
-          if (webhook.linkScope === "workspace") {
-            return true;
-          }
-
-          if (webhook.linkScope === "links") {
-            return (
-              linkWebhooksByLinkId[event.link_id]?.some(
-                (r) => r.webhookId === webhook.id,
-              ) ?? false
-            );
-          }
-
-          if (webhook.linkScope === "folders") {
-            return (
-              link.folderId != null &&
-              folderWebhooksByFolderId[link.folderId]?.some(
-                (r) => r.webhookId === webhook.id,
-              )
-            );
-          }
-
-          return false;
-        });
-
-        if (applicableWebhooks.length === 0) {
-          processedEntryIds.push(entry.id);
-          continue;
-        }
-
-        sendTasks.push({
-          entryId: entry.id,
-          task: async () => {
-            try {
-              const results = await sendWebhooks({
-                trigger: LINK_CLICK_WEBHOOK_TRIGGER,
-                webhooks: applicableWebhooks,
-                data: transformClickEventData({
-                  ...event,
-                  link: transformLink(link),
-                }),
-              });
-
-              return results.every((r) => r.ok);
-            } catch (error) {
-              return false;
-            }
-          },
-        });
-      }
-
-      let sent = 0;
-      let failed = 0;
-
-      for (const batch of chunk(sendTasks, SEND_CONCURRENCY)) {
-        const results = await Promise.allSettled(
-          batch.map(({ task }) => task()),
-        );
-
-        batch.forEach(({ entryId }, i) => {
-          if (results[i].status === "fulfilled") {
-            processedEntryIds.push(entryId);
-            sent++;
-          } else {
-            failed++;
-          }
-        });
-      }
-
-      return {
-        processed: processedEntryIds.length,
-        sent,
-        failed,
-        processedEntryIds,
-      };
-    },
-    {
-      count: BATCH_SIZE,
-      deleteAfterRead: true,
-    },
-  );

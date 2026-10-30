@@ -13,7 +13,7 @@ import { assertRateLimit } from "@/lib/upstash/assert-rate-limit";
 import { RATELIMIT_POLICIES } from "@/lib/upstash/ratelimit-policies";
 import { parseAnalyticsQuery } from "@/lib/zod/schemas/analytics";
 
-export const maxDuration = 300;
+export const maxDuration = 60;
 
 // GET /api/analytics/export – get export data for analytics
 export const GET = withWorkspace(
